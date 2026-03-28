@@ -50,6 +50,7 @@ class MatchResult(BaseModel):
     score_breakdown: ScoreBreakdown
     skill_matches: list[SkillMatch] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
+    strengths: list[str] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
     computed_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
