@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from app.ui.pages import (
+from app.ui.views import (
     dashboard_page,
     discovery_page,
     profile_page,
