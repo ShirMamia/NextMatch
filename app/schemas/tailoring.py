@@ -1,27 +1,26 @@
 """
-Tailoring schema — Slice 1 foundation.
+Tailoring schema — Slice 1 foundation, extended in Slice 6.
 
 TailoredResume is the primary artifact of the generation pipeline.
 Every tailored claim carries a grounding structure back to source material,
 enabling validation and user review before approval.
+
+CoverLetterDraft carries the same grounding pattern: evidence_links make
+every generated letter traceable to the source profile material.
 
 Truthfulness contract:
   - The system may rewrite, reorder, shorten, and prioritize content.
   - The system must not invent claims, metrics, tools, or experience.
   - Every tailored claim must be traceable to source evidence via EvidenceLink.
   - No TailoredResume may be saved as approved without passing validation.
-
-Design note — summary and cover letter:
-  - summary is a GroundedText: structured text with list[EvidenceLink],
-    using the same evidence model as TailoredBullet for consistency.
-  - cover_letter_draft is excluded from TailoredResume in Slice 1 and
-    will be introduced in a later slice as its own grounded schema.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 from pydantic import BaseModel, Field, model_validator
+
+from app.utils.time import utc_now
 
 
 class EvidenceLink(BaseModel):
@@ -65,9 +64,7 @@ class TailoredResume(BaseModel):
     summary: GroundedText = Field(default_factory=lambda: GroundedText(text=""))
     # Section name → ordered list of tailored bullets.
     sections: dict[str, list[TailoredBullet]] = Field(default_factory=dict)
-    generated_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    generated_at: datetime = Field(default_factory=utc_now)
     approved_at: datetime | None = None
     approved: bool = False
 
@@ -78,3 +75,24 @@ class TailoredResume(BaseModel):
         if not self.approved and self.approved_at is not None:
             raise ValueError("approved_at must be None when approved=False")
         return self
+
+
+class CoverLetterDraft(BaseModel):
+    """A generated cover letter draft for a specific job application.
+
+    Grounded in the candidate profile and match result strengths.
+    evidence_links maps each key claim in the body back to the source material
+    it was derived from, enabling downstream validation.
+
+    Preview-only until validation and approval are implemented (Slice 7+).
+    """
+
+    model_config = {"extra": "forbid"}
+
+    draft_id: str
+    candidate_id: str
+    job_id: str
+    match_id: str
+    body: str  # full cover letter text
+    evidence_links: list[EvidenceLink] = Field(default_factory=list)
+    generated_at: datetime = Field(default_factory=utc_now)

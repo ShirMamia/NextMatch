@@ -1,27 +1,36 @@
 """
-Tailoring Studio page — Slice 5.
+Tailoring Studio page — Slices 5 and 6.
 
-Slice 5 scope: candidate-job fit analysis only.
-Resume generation, validation, and approval come in later slices.
+Slice 5 scope (already complete): candidate-job fit analysis.
+Slice 6 scope (this update): tailored resume and cover letter generation.
 
-This page:
-  1. Detects whether a CandidateProfile is loaded.
-  2. Detects whether a JobPosting is selected.
-  3. Shows clear empty states when either is missing.
-  4. Computes and displays a MatchResult when both are present.
-  5. Makes the distinction between Slice 4 search-profile fit and Slice 5
-     candidate-job fit explicit and visible.
+Page structure:
+  1. Empty-state guards — profile and job must both be present.
+  2. Slice 5 — candidate-job fit analysis (match score, skill detail, gaps, strengths).
+  3. Slice 6 — generation area (tailored resume draft + cover letter draft).
 
-All matching logic lives in app/matching/. This file is a thin UI shell only.
+Generation rules:
+  - Only available when a MatchResult exists in session state.
+  - Generated output is preview-only in this slice.
+  - Artifacts are NOT saved as approved outputs — approval requires Slice 7 validation.
+  - Cache is invalidated automatically when the job or candidate changes.
+
+All matching logic lives in app/matching/. All generation logic lives in app/generation/.
+This file is a thin UI shell only.
 """
 from __future__ import annotations
 
 import streamlit as st
 
+from app.generation.cover_letter_generator import generate_cover_letter
+from app.generation.resume_tailor import generate_tailored_resume
 from app.matching.matcher import compute_match
 from app.schemas.candidate import CandidateProfile
 from app.schemas.job import JobPosting
 from app.schemas.match import MatchResult
+from app.schemas.tailoring import CoverLetterDraft, TailoredResume
+from app.services.llm_client import LLMParseError
+from app.ui.components import evidence_panel
 
 
 def render() -> None:
@@ -53,12 +62,13 @@ def render() -> None:
         )
         return
 
-    # --- Both exist: compute match ---
+    # --- Both exist: Slice 5 match analysis, then Slice 6 generation ---
     _render_match_analysis(profile, job)
+    _render_generation_section(profile, job)
 
 
 # ---------------------------------------------------------------------------
-# Match analysis rendering
+# Slice 5 — Match analysis
 # ---------------------------------------------------------------------------
 
 def _render_match_analysis(profile: CandidateProfile, job: JobPosting) -> None:
@@ -118,13 +128,6 @@ def _render_match_analysis(profile: CandidateProfile, job: JobPosting) -> None:
         for r in result.recommendations:
             st.markdown(f"- {r}")
 
-    # --- Future slices placeholder ---
-    st.divider()
-    st.info(
-        "Resume tailoring and cover letter generation will be available in Slice 6. "
-        "Validation and approval gates come in Slice 7."
-    )
-
 
 def _render_score_breakdown(result: MatchResult) -> None:
     """Display per-factor scores as a table of metrics."""
@@ -170,3 +173,120 @@ def _render_skill_detail(result: MatchResult) -> None:
                 st.markdown(f"- `{sm.skill}`")
         else:
             st.caption("All skill tags from the job posting were found in your profile.")
+
+
+# ---------------------------------------------------------------------------
+# Slice 6 — Generation (tailored resume + cover letter)
+# ---------------------------------------------------------------------------
+
+def _render_generation_section(profile: CandidateProfile, job: JobPosting) -> None:
+    """Render the Slice 6 generation area below the Slice 5 match analysis."""
+    st.divider()
+    st.subheader("Resume Generation")
+    st.caption(
+        "\u26a0\ufe0f **Preview only.** Generated content is not saved as an approved artifact. "
+        "Validation and approval gates come in Slice 7."
+    )
+
+    match_result: MatchResult | None = st.session_state.get("match_result")
+    if match_result is None:
+        st.info("Match analysis must complete before generation is available.")
+        return
+
+    # --- Invalidate cached artifacts if job or candidate changed ---
+    _clear_stale_generation_cache(profile, job)
+
+    # --- Tailored resume ---
+    st.markdown("#### Tailored Resume Draft")
+    if st.button("Generate Tailored Resume", key="btn_generate_resume"):
+        with st.spinner("Generating tailored resume\u2026"):
+            try:
+                resume = generate_tailored_resume(profile, job, match_result)
+                st.session_state.tailored_resume = resume
+            except LLMParseError as exc:
+                st.error(f"Resume generation failed (LLM parse error): {exc}")
+            except Exception as exc:
+                st.error(f"Resume generation failed: {exc}")
+
+    resume: TailoredResume | None = st.session_state.get("tailored_resume")
+    if resume is not None:
+        _render_tailored_resume(resume)
+
+    st.divider()
+
+    # --- Cover letter ---
+    st.markdown("#### Cover Letter Draft")
+    if st.button("Generate Cover Letter", key="btn_generate_cover_letter"):
+        with st.spinner("Generating cover letter\u2026"):
+            try:
+                cl = generate_cover_letter(profile, job, match_result)
+                st.session_state.cover_letter_draft = cl
+            except ValueError as exc:
+                st.error(f"Cannot generate cover letter: {exc}")
+            except LLMParseError as exc:
+                st.error(f"Cover letter generation failed (LLM parse error): {exc}")
+            except Exception as exc:
+                st.error(f"Cover letter generation failed: {exc}")
+
+    cl: CoverLetterDraft | None = st.session_state.get("cover_letter_draft")
+    if cl is not None:
+        _render_cover_letter(cl)
+
+
+def _clear_stale_generation_cache(profile: CandidateProfile, job: JobPosting) -> None:
+    """Clear cached generation artifacts when the job or candidate has changed."""
+    resume: TailoredResume | None = st.session_state.get("tailored_resume")
+    if resume is not None and (
+        resume.job_id != job.job_id or resume.candidate_id != profile.candidate_id
+    ):
+        st.session_state.tailored_resume = None
+        st.session_state.cover_letter_draft = None
+        st.info("Job or candidate changed — previous draft cleared.")
+        return
+
+    cl: CoverLetterDraft | None = st.session_state.get("cover_letter_draft")
+    if cl is not None and (
+        cl.job_id != job.job_id or cl.candidate_id != profile.candidate_id
+    ):
+        st.session_state.cover_letter_draft = None
+
+
+def _render_tailored_resume(resume: TailoredResume) -> None:
+    """Display the generated TailoredResume with inline source evidence."""
+    # Summary
+    if resume.summary.text:
+        st.markdown("**Professional Summary**")
+        st.markdown(resume.summary.text)
+        if resume.summary.evidence_links:
+            with st.expander("Summary — source evidence", expanded=False):
+                for ev in resume.summary.evidence_links:
+                    st.caption(
+                        f"Section: `{ev.source_section}` | "
+                        f"Confidence: {int(ev.confidence * 100)}%"
+                    )
+                    st.text(ev.source_bullet)
+        st.write("")
+
+    # Experience sections
+    if not resume.sections:
+        st.caption("No work experience bullets to display.")
+        return
+
+    for section_name, bullets in resume.sections.items():
+        # Strip the index prefix for display: "work_experience[0] — Acme — Engineer"
+        # → "Acme — Engineer"
+        display_name = section_name.split(" — ", maxsplit=1)[-1] if " — " in section_name else section_name
+        st.markdown(f"**{display_name}**")
+        evidence_panel.render(bullets)
+        st.write("")
+
+
+def _render_cover_letter(cl: CoverLetterDraft) -> None:
+    """Display the generated cover letter draft with its evidence links."""
+    st.markdown(cl.body)
+
+    if cl.evidence_links:
+        with st.expander("Cover letter — source evidence", expanded=False):
+            for ev in cl.evidence_links:
+                st.caption(f"Section: `{ev.source_section}`")
+                st.text(ev.source_bullet)
