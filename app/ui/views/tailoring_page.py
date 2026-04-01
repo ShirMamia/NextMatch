@@ -1,22 +1,25 @@
 """
-Tailoring Studio page — Slices 5 and 6.
+Tailoring Studio page — Slices 5, 6, and 7.
 
-Slice 5 scope (already complete): candidate-job fit analysis.
-Slice 6 scope (this update): tailored resume and cover letter generation.
+Slice 5 scope (complete): candidate-job fit analysis.
+Slice 6 scope (complete): tailored resume and cover letter generation.
+Slice 7 scope (this update): validation of generated drafts.
 
 Page structure:
   1. Empty-state guards — profile and job must both be present.
   2. Slice 5 — candidate-job fit analysis (match score, skill detail, gaps, strengths).
   3. Slice 6 — generation area (tailored resume draft + cover letter draft).
+  4. Slice 7 — validation area (validate generated drafts, display ValidationReport).
 
-Generation rules:
-  - Only available when a MatchResult exists in session state.
-  - Generated output is preview-only in this slice.
-  - Artifacts are NOT saved as approved outputs — approval requires Slice 7 validation.
-  - Cache is invalidated automatically when the job or candidate changes.
+Validation rules:
+  - Validation is available once a draft exists in session state.
+  - Validation is deterministic — no LLM calls.
+  - Validation results are preview-only review flags.
+  - Approval and save flow are NOT implemented here — that is Slice 8.
+  - Cached validation reports are cleared when the job, candidate, or draft changes.
 
 All matching logic lives in app/matching/. All generation logic lives in app/generation/.
-This file is a thin UI shell only.
+All validation logic lives in app/validation/. This file is a thin UI shell only.
 """
 from __future__ import annotations
 
@@ -29,8 +32,10 @@ from app.schemas.candidate import CandidateProfile
 from app.schemas.job import JobPosting
 from app.schemas.match import MatchResult
 from app.schemas.tailoring import CoverLetterDraft, TailoredResume
+from app.schemas.validation import ValidationReport
 from app.services.llm_client import LLMParseError
-from app.ui.components import evidence_panel
+from app.ui.components import evidence_panel, validation_panel
+from app.validation.validator import validate_cover_letter, validate_resume
 
 
 def render() -> None:
@@ -62,9 +67,10 @@ def render() -> None:
         )
         return
 
-    # --- Both exist: Slice 5 match analysis, then Slice 6 generation ---
+    # --- Both exist: Slice 5 match analysis, Slice 6 generation, Slice 7 validation ---
     _render_match_analysis(profile, job)
     _render_generation_section(profile, job)
+    _render_validation_section(profile, job)
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +191,7 @@ def _render_generation_section(profile: CandidateProfile, job: JobPosting) -> No
     st.subheader("Resume Generation")
     st.caption(
         "\u26a0\ufe0f **Preview only.** Generated content is not saved as an approved artifact. "
-        "Validation and approval gates come in Slice 7."
+        "Validate your draft below, then approve it in the next step (coming in Slice 8)."
     )
 
     match_result: MatchResult | None = st.session_state.get("match_result")
@@ -203,6 +209,8 @@ def _render_generation_section(profile: CandidateProfile, job: JobPosting) -> No
             try:
                 resume = generate_tailored_resume(profile, job, match_result)
                 st.session_state.tailored_resume = resume
+                # Clear any previous validation result for this artifact.
+                st.session_state.resume_validation = None
             except LLMParseError as exc:
                 st.error(f"Resume generation failed (LLM parse error): {exc}")
             except Exception as exc:
@@ -221,6 +229,8 @@ def _render_generation_section(profile: CandidateProfile, job: JobPosting) -> No
             try:
                 cl = generate_cover_letter(profile, job, match_result)
                 st.session_state.cover_letter_draft = cl
+                # Clear any previous validation result for this artifact.
+                st.session_state.cover_letter_validation = None
             except ValueError as exc:
                 st.error(f"Cannot generate cover letter: {exc}")
             except LLMParseError as exc:
@@ -234,14 +244,16 @@ def _render_generation_section(profile: CandidateProfile, job: JobPosting) -> No
 
 
 def _clear_stale_generation_cache(profile: CandidateProfile, job: JobPosting) -> None:
-    """Clear cached generation artifacts when the job or candidate has changed."""
+    """Clear cached generation artifacts and validation results when job or candidate has changed."""
     resume: TailoredResume | None = st.session_state.get("tailored_resume")
     if resume is not None and (
         resume.job_id != job.job_id or resume.candidate_id != profile.candidate_id
     ):
         st.session_state.tailored_resume = None
         st.session_state.cover_letter_draft = None
-        st.info("Job or candidate changed — previous draft cleared.")
+        st.session_state.resume_validation = None
+        st.session_state.cover_letter_validation = None
+        st.info("Job or candidate changed — previous drafts and validation results cleared.")
         return
 
     cl: CoverLetterDraft | None = st.session_state.get("cover_letter_draft")
@@ -249,6 +261,7 @@ def _clear_stale_generation_cache(profile: CandidateProfile, job: JobPosting) ->
         cl.job_id != job.job_id or cl.candidate_id != profile.candidate_id
     ):
         st.session_state.cover_letter_draft = None
+        st.session_state.cover_letter_validation = None
 
 
 def _render_tailored_resume(resume: TailoredResume) -> None:
@@ -290,3 +303,49 @@ def _render_cover_letter(cl: CoverLetterDraft) -> None:
             for ev in cl.evidence_links:
                 st.caption(f"Section: `{ev.source_section}`")
                 st.text(ev.source_bullet)
+
+
+# ---------------------------------------------------------------------------
+# Slice 7 — Validation
+# ---------------------------------------------------------------------------
+
+def _render_validation_section(profile: CandidateProfile, job: JobPosting) -> None:
+    """Render the Slice 7 validation area below the generated drafts."""
+    st.divider()
+    st.subheader("Draft Validation")
+    st.caption(
+        "\u26a0\ufe0f **Validation is a review gate only.** "
+        "Approval and save functionality will be available in the next step (Slice 8). "
+        "Validation does not modify any generated content."
+    )
+
+    resume: TailoredResume | None = st.session_state.get("tailored_resume")
+    cl: CoverLetterDraft | None = st.session_state.get("cover_letter_draft")
+
+    if resume is None and cl is None:
+        st.info("Generate a tailored resume or cover letter above to enable validation.")
+        return
+
+    # --- Resume validation ---
+    if resume is not None:
+        st.markdown("#### Validate Tailored Resume")
+        if st.button("Validate Resume Draft", key="btn_validate_resume"):
+            with st.spinner("Validating resume draft\u2026"):
+                report = validate_resume(resume)
+                st.session_state.resume_validation = report
+
+        resume_report: ValidationReport | None = st.session_state.get("resume_validation")
+        if resume_report is not None:
+            validation_panel.render(resume_report)
+
+    # --- Cover letter validation ---
+    if cl is not None:
+        st.markdown("#### Validate Cover Letter")
+        if st.button("Validate Cover Letter Draft", key="btn_validate_cover_letter"):
+            with st.spinner("Validating cover letter draft\u2026"):
+                report = validate_cover_letter(cl)
+                st.session_state.cover_letter_validation = report
+
+        cl_report: ValidationReport | None = st.session_state.get("cover_letter_validation")
+        if cl_report is not None:
+            validation_panel.render(cl_report)
