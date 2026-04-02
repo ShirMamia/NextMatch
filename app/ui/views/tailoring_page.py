@@ -1,25 +1,39 @@
 """
-Tailoring Studio page — Slices 5, 6, and 7.
+Tailoring Studio page — Slices 5, 6, 7, and 8.
 
 Slice 5 scope (complete): candidate-job fit analysis.
 Slice 6 scope (complete): tailored resume and cover letter generation.
-Slice 7 scope (this update): validation of generated drafts.
+Slice 7 scope (complete): validation of generated drafts.
+Slice 8 scope (complete): approval gate and save to application tracker.
 
 Page structure:
   1. Empty-state guards — profile and job must both be present.
   2. Slice 5 — candidate-job fit analysis (match score, skill detail, gaps, strengths).
   3. Slice 6 — generation area (tailored resume draft + cover letter draft).
   4. Slice 7 — validation area (validate generated drafts, display ValidationReport).
+  5. Slice 8 — approval area (gate status, Approve and Save button, tracker link).
 
-Validation rules:
-  - Validation is available once a draft exists in session state.
-  - Validation is deterministic — no LLM calls.
-  - Validation results are preview-only review flags.
-  - Approval and save flow are NOT implemented here — that is Slice 8.
-  - Cached validation reports are cleared when the job, candidate, or draft changes.
+Approval rules:
+  - Requires a TailoredResume in session state.
+  - Requires a passing resume ValidationReport whose artifact_id matches the current resume.
+  - If a CoverLetterDraft exists, also requires a passing cover letter ValidationReport
+    whose artifact_id matches the current draft.
+  - Approval readiness is evaluated from the current session state on every render.
+  - The duplicate-save guard only fires when current validation is still valid for
+    the exact same artifact set that was previously approved.
+  - Re-running validation always clears prior approval UI state so that any change in
+    validation results is reflected before the user can re-approve.
+  - Stale approval state is also cleared when the job, candidate, or drafts change.
+  - All approval and persistence logic delegates to the application pipeline and
+    TrackerService; this page is a thin UI shell only.
+
+Session state keys managed here (in addition to those from Slices 5–7):
+  saved_application_record    — ApplicationRecord returned from a successful approval
+  approved_artifact_signature — artifact signature string at the time of approval
 
 All matching logic lives in app/matching/. All generation logic lives in app/generation/.
-All validation logic lives in app/validation/. This file is a thin UI shell only.
+All validation logic lives in app/validation/. All approval/save logic lives in
+app/orchestration/ and app/reporting/. This file is a thin UI shell only.
 """
 from __future__ import annotations
 
@@ -28,12 +42,17 @@ import streamlit as st
 from app.generation.cover_letter_generator import generate_cover_letter
 from app.generation.resume_tailor import generate_tailored_resume
 from app.matching.matcher import compute_match
+from app.orchestration.application_pipeline import ApprovalError, approve_and_save
+from app.reporting.tracker import TrackerService
+from app.schemas.application import ApplicationRecord
 from app.schemas.candidate import CandidateProfile
 from app.schemas.job import JobPosting
 from app.schemas.match import MatchResult
 from app.schemas.tailoring import CoverLetterDraft, TailoredResume
 from app.schemas.validation import ValidationReport
+from app.services.config import get_config
 from app.services.llm_client import LLMParseError
+from app.storage.file_store import FileStore
 from app.ui.components import evidence_panel, validation_panel
 from app.validation.validator import validate_cover_letter, validate_resume
 
@@ -67,10 +86,11 @@ def render() -> None:
         )
         return
 
-    # --- Both exist: Slice 5 match analysis, Slice 6 generation, Slice 7 validation ---
+    # --- Both exist: match analysis → generation → validation → approval ---
     _render_match_analysis(profile, job)
     _render_generation_section(profile, job)
-    _render_validation_section(profile, job)
+    _render_validation_section()
+    _render_approval_section()
 
 
 # ---------------------------------------------------------------------------
@@ -190,8 +210,8 @@ def _render_generation_section(profile: CandidateProfile, job: JobPosting) -> No
     st.divider()
     st.subheader("Resume Generation")
     st.caption(
-        "\u26a0\ufe0f **Preview only.** Generated content is not saved as an approved artifact. "
-        "Validate your draft below, then approve it in the next step (coming in Slice 8)."
+        "\u26a0\ufe0f **Preview only.** Generated content is not saved until approved. "
+        "Validate your draft below, then use the **Approve and Save** section to persist it."
     )
 
     match_result: MatchResult | None = st.session_state.get("match_result")
@@ -209,8 +229,9 @@ def _render_generation_section(profile: CandidateProfile, job: JobPosting) -> No
             try:
                 resume = generate_tailored_resume(profile, job, match_result)
                 st.session_state.tailored_resume = resume
-                # Clear any previous validation result for this artifact.
+                # New resume: clear validation and any previous approval state.
                 st.session_state.resume_validation = None
+                _clear_saved_approval_state()
             except LLMParseError as exc:
                 st.error(f"Resume generation failed (LLM parse error): {exc}")
             except Exception as exc:
@@ -229,8 +250,9 @@ def _render_generation_section(profile: CandidateProfile, job: JobPosting) -> No
             try:
                 cl = generate_cover_letter(profile, job, match_result)
                 st.session_state.cover_letter_draft = cl
-                # Clear any previous validation result for this artifact.
+                # New cover letter: clear validation and any previous approval state.
                 st.session_state.cover_letter_validation = None
+                _clear_saved_approval_state()
             except ValueError as exc:
                 st.error(f"Cannot generate cover letter: {exc}")
             except LLMParseError as exc:
@@ -244,7 +266,7 @@ def _render_generation_section(profile: CandidateProfile, job: JobPosting) -> No
 
 
 def _clear_stale_generation_cache(profile: CandidateProfile, job: JobPosting) -> None:
-    """Clear cached generation artifacts and validation results when job or candidate has changed."""
+    """Clear cached generation artifacts, validation, and approval state when job or candidate changed."""
     resume: TailoredResume | None = st.session_state.get("tailored_resume")
     if resume is not None and (
         resume.job_id != job.job_id or resume.candidate_id != profile.candidate_id
@@ -253,7 +275,8 @@ def _clear_stale_generation_cache(profile: CandidateProfile, job: JobPosting) ->
         st.session_state.cover_letter_draft = None
         st.session_state.resume_validation = None
         st.session_state.cover_letter_validation = None
-        st.info("Job or candidate changed — previous drafts and validation results cleared.")
+        _clear_saved_approval_state()
+        st.info("Job or candidate changed — previous drafts, validation, and approval state cleared.")
         return
 
     cl: CoverLetterDraft | None = st.session_state.get("cover_letter_draft")
@@ -262,6 +285,21 @@ def _clear_stale_generation_cache(profile: CandidateProfile, job: JobPosting) ->
     ):
         st.session_state.cover_letter_draft = None
         st.session_state.cover_letter_validation = None
+        _clear_saved_approval_state()
+
+
+def _clear_saved_approval_state() -> None:
+    """Clear approval UI state so the approval section re-evaluates from scratch.
+
+    Called whenever generation or validation state changes materially:
+    - new resume generated
+    - new cover letter generated
+    - resume validation re-run
+    - cover letter validation re-run
+    - job or candidate changed
+    """
+    st.session_state.saved_application_record = None
+    st.session_state.approved_artifact_signature = None
 
 
 def _render_tailored_resume(resume: TailoredResume) -> None:
@@ -309,13 +347,13 @@ def _render_cover_letter(cl: CoverLetterDraft) -> None:
 # Slice 7 — Validation
 # ---------------------------------------------------------------------------
 
-def _render_validation_section(profile: CandidateProfile, job: JobPosting) -> None:
+def _render_validation_section() -> None:
     """Render the Slice 7 validation area below the generated drafts."""
     st.divider()
     st.subheader("Draft Validation")
     st.caption(
-        "\u26a0\ufe0f **Validation is a review gate only.** "
-        "Approval and save functionality will be available in the next step (Slice 8). "
+        "\u26a0\ufe0f **Validation is a review gate.** "
+        "Critical flags must be resolved before approval is allowed. "
         "Validation does not modify any generated content."
     )
 
@@ -333,6 +371,9 @@ def _render_validation_section(profile: CandidateProfile, job: JobPosting) -> No
             with st.spinner("Validating resume draft\u2026"):
                 report = validate_resume(resume)
                 st.session_state.resume_validation = report
+                # Re-running validation always clears prior approval UI state so
+                # any change in results is reflected before the user can re-approve.
+                _clear_saved_approval_state()
 
         resume_report: ValidationReport | None = st.session_state.get("resume_validation")
         if resume_report is not None:
@@ -345,7 +386,143 @@ def _render_validation_section(profile: CandidateProfile, job: JobPosting) -> No
             with st.spinner("Validating cover letter draft\u2026"):
                 report = validate_cover_letter(cl)
                 st.session_state.cover_letter_validation = report
+                # Same as above: clear prior approval UI state on re-validation.
+                _clear_saved_approval_state()
 
         cl_report: ValidationReport | None = st.session_state.get("cover_letter_validation")
         if cl_report is not None:
             validation_panel.render(cl_report)
+
+
+# ---------------------------------------------------------------------------
+# Slice 8 — Approval and Save
+# ---------------------------------------------------------------------------
+
+def _artifact_signature(resume: TailoredResume, cl: CoverLetterDraft | None) -> str:
+    """Return a stable string key for the current artifact set.
+
+    Used to detect whether the same resume+cover-letter combination has already
+    been approved this session. The signature changes whenever a new resume or
+    new cover letter is generated, preventing duplicate saves.
+    """
+    cl_part = cl.draft_id if cl is not None else "none"
+    return f"{resume.resume_id}:{cl_part}"
+
+
+def _check_approval_readiness(
+    resume: TailoredResume,
+    resume_report: ValidationReport | None,
+    cl: CoverLetterDraft | None,
+    cl_report: ValidationReport | None,
+) -> list[str]:
+    """Return a list of human-readable blocking reasons.
+
+    An empty list means all gate conditions are satisfied and approval may proceed.
+    The pipeline enforces these same rules; this function is for UI feedback only.
+    """
+    blocking: list[str] = []
+
+    if resume_report is None:
+        blocking.append(
+            "Resume validation has not been run \u2014 click **Validate Resume Draft** above."
+        )
+    elif resume_report.artifact_id != resume.resume_id:
+        blocking.append(
+            "Resume validation report is stale (artifact ID mismatch). "
+            "Re-run **Validate Resume Draft** after any regeneration."
+        )
+    elif not resume_report.passed:
+        blocking.append(
+            "Resume validation failed \u2014 resolve all critical flags before approving."
+        )
+
+    if cl is not None:
+        if cl_report is None:
+            blocking.append(
+                "Cover letter validation has not been run \u2014 "
+                "click **Validate Cover Letter Draft** above."
+            )
+        elif cl_report.artifact_id != cl.draft_id:
+            blocking.append(
+                "Cover letter validation report is stale (artifact ID mismatch). "
+                "Re-run **Validate Cover Letter Draft** after any regeneration."
+            )
+        elif not cl_report.passed:
+            blocking.append(
+                "Cover letter validation failed \u2014 resolve all critical flags before approving."
+            )
+
+    return blocking
+
+
+def _render_approval_section() -> None:
+    """Render the Slice 8 approval gate and Approve and Save button."""
+    resume: TailoredResume | None = st.session_state.get("tailored_resume")
+    if resume is None:
+        return
+
+    cl: CoverLetterDraft | None = st.session_state.get("cover_letter_draft")
+    resume_report: ValidationReport | None = st.session_state.get("resume_validation")
+    cl_report: ValidationReport | None = st.session_state.get("cover_letter_validation")
+
+    st.divider()
+    st.subheader("Approve and Save")
+    st.caption(
+        "Approval persists the validated artifacts and creates a record in the "
+        "**Application Tracker**. No content is modified during approval. "
+        "Once saved, the record can be managed from the Tracker page."
+    )
+
+    # --- Evaluate current readiness first ---
+    # This must happen before the duplicate-save guard so that stale or failing
+    # validation state is always surfaced, even when a prior approval exists.
+    blocking = _check_approval_readiness(resume, resume_report, cl, cl_report)
+    if blocking:
+        st.warning("**Approval is not ready.** Resolve the following before saving:")
+        for reason in blocking:
+            st.markdown(f"- {reason}")
+        return
+
+    # --- Current validation is valid: now check for duplicate saves ---
+    # Only show "already approved" when validation is still passing AND the
+    # exact same artifact set was approved this session. If the user re-ran
+    # validation after a prior approval, _clear_saved_approval_state() would
+    # have already cleared the saved record (called inside the validation buttons),
+    # so this guard will not fire for stale approval state.
+    current_sig = _artifact_signature(resume, cl)
+    saved_record: ApplicationRecord | None = st.session_state.get("saved_application_record")
+    approved_sig: str | None = st.session_state.get("approved_artifact_signature")
+
+    if saved_record is not None and approved_sig == current_sig:
+        st.success(
+            f"Already approved and saved. "
+            f"Application ID: `{saved_record.application_id[:8]}\u2026` "
+            f"| Status: **{saved_record.status.value}**"
+        )
+        st.info("View and manage this application on the **Application Tracker** page.")
+        return
+
+    # --- All clear: show Approve and Save button ---
+    st.success("All validation checks passed \u2014 ready to approve.")
+
+    if st.button("Approve and Save", key="btn_approve_and_save", type="primary"):
+        with st.spinner("Saving approved artifacts\u2026"):
+            try:
+                cfg = get_config()
+                store = FileStore(cfg.data_dir)
+                tracker = TrackerService(store)
+                record = approve_and_save(
+                    resume, cl, resume_report, cl_report, tracker, store
+                )
+                st.session_state.saved_application_record = record
+                st.session_state.approved_artifact_signature = current_sig
+                st.success(
+                    f"Approved and saved. "
+                    f"Application ID: `{record.application_id[:8]}\u2026` "
+                    f"| Status: **{record.status.value}**"
+                )
+                st.info("View and manage this application on the **Application Tracker** page.")
+            except ApprovalError as exc:
+                st.error(f"Approval blocked: {exc}")
+            except Exception as exc:
+                st.error(f"Approval failed unexpectedly: {exc}")
