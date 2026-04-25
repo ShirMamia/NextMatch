@@ -1,15 +1,16 @@
 """
-Dashboard page — Slice 9.
+Dashboard page — Slice 10 (updated from Slice 9).
 
-Displays computed metrics from all saved ApplicationRecords and provides
-an XLSX export button.
+Displays computed metrics from all saved ApplicationRecords with a bar chart
+status breakdown, and provides an XLSX export button.
 
 Page structure:
   1. Load all ApplicationRecords via TrackerService.
   2. Compute summary via compute_summary().
   3. Show headline KPIs (total, active pipeline, rates).
-  4. Show per-status breakdown.
-  5. Offer XLSX export via st.download_button (in-memory, no temp file).
+  4. Show a bar chart of non-zero status counts.
+  5. Show the full per-status count table (all 9 statuses).
+  6. Offer XLSX export via st.download_button (in-memory, no temp file).
 
 All computation delegates to app.reporting.dashboard and app.reporting.exporter.
 This file is a thin UI shell only — no business logic lives here.
@@ -18,26 +19,27 @@ from __future__ import annotations
 
 import io
 
+import pandas as pd
 import streamlit as st
 
 from app.reporting.dashboard import compute_summary
-from app.reporting.exporter import export_to_xlsx, records_to_rows
+from app.reporting.exporter import export_to_xlsx
 from app.reporting.tracker import TrackerService
 from app.schemas.application import ApplicationStatus
 from app.services.config import get_config
 from app.storage.file_store import FileStore
 
-# Human-readable labels for each status, used in the breakdown table.
+# Human-readable labels for each status.
 _STATUS_LABEL: dict[ApplicationStatus, str] = {
-    ApplicationStatus.DISCOVERED: "Discovered",
-    ApplicationStatus.SAVED: "Saved",
-    ApplicationStatus.TAILORED: "Tailored",
-    ApplicationStatus.APPROVED: "Approved",
-    ApplicationStatus.APPLIED: "Applied",
+    ApplicationStatus.DISCOVERED:   "Discovered",
+    ApplicationStatus.SAVED:        "Saved",
+    ApplicationStatus.TAILORED:     "Tailored",
+    ApplicationStatus.APPROVED:     "Approved",
+    ApplicationStatus.APPLIED:      "Applied",
     ApplicationStatus.INTERVIEWING: "Interviewing",
-    ApplicationStatus.OFFERED: "Offer received",
-    ApplicationStatus.REJECTED: "Rejected",
-    ApplicationStatus.WITHDRAWN: "Withdrawn",
+    ApplicationStatus.OFFERED:      "Offer received",
+    ApplicationStatus.REJECTED:     "Rejected",
+    ApplicationStatus.WITHDRAWN:    "Withdrawn",
 }
 
 
@@ -78,20 +80,33 @@ def render() -> None:
 
     st.divider()
 
-    # --- Per-status breakdown ---
+    # --- Status breakdown: bar chart + table ---
     st.subheader("Status breakdown")
 
-    breakdown_rows = []
-    for status in ApplicationStatus:
-        count = summary.by_status.get(status.value, 0)
-        label = _STATUS_LABEL.get(status, status.value)
-        breakdown_rows.append({"Status": label, "Count": count})
+    # Build a DataFrame of all statuses for the table.
+    breakdown_rows = [
+        {
+            "Status": _STATUS_LABEL.get(status, status.value),
+            "Count": summary.by_status.get(status.value, 0),
+        }
+        for status in ApplicationStatus
+    ]
+    df_all = pd.DataFrame(breakdown_rows)
 
-    # Display as a compact table using columns.
-    for row in breakdown_rows:
-        c_label, c_count = st.columns([3, 1])
-        c_label.write(row["Status"])
-        c_count.write(str(row["Count"]))
+    # Bar chart: only statuses with at least one record to keep the visual clean.
+    df_nonzero = df_all[df_all["Count"] > 0].copy()
+
+    if not df_nonzero.empty:
+        # Set Status as the index so st.bar_chart uses it as the x-axis label.
+        df_chart = df_nonzero.set_index("Status")
+        st.bar_chart(df_chart, y="Count", use_container_width=True)
+
+    # Full count table below the chart.
+    st.dataframe(
+        df_all,
+        use_container_width=True,
+        hide_index=True,
+    )
 
     st.divider()
 

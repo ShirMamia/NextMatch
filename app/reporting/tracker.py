@@ -8,6 +8,7 @@ Public interface:
   TrackerService.get_application(application_id) → ApplicationRecord | None
   TrackerService.list_applications()            → list[ApplicationRecord]
   TrackerService.update_status(application_id, new_status) → ApplicationRecord
+  TrackerService.update_notes(application_id, notes)       → ApplicationRecord
 
 All persistence goes through the Repository interface; no direct file I/O here.
 Status-change logic handles applied_at automatically to keep records consistent
@@ -127,4 +128,34 @@ class TrackerService:
             record.status.value,
             new_status.value,
         )
+        return updated
+
+    def update_notes(self, application_id: str, notes: str) -> ApplicationRecord:
+        """Update the free-text notes on an existing application.
+
+        Uses the same model_validate pattern as update_status to ensure
+        full schema revalidation before persisting.
+
+        Args:
+            application_id: ID of the record to update.
+            notes:          New notes value. May be empty string.
+
+        Returns:
+            The updated and revalidated ApplicationRecord.
+
+        Raises:
+            ValueError: if no application with the given ID is found.
+        """
+        record = self.get_application(application_id)
+        if record is None:
+            raise ValueError(f"Application '{application_id}' not found")
+
+        now = utc_now()
+        merged = record.model_dump(mode="json")
+        merged["notes"] = notes
+        merged["updated_at"] = now.isoformat()
+
+        updated = ApplicationRecord.model_validate(merged)
+        self.save_application(updated)
+        logger.debug("Updated notes for application '%s'", application_id)
         return updated
