@@ -13,6 +13,8 @@ Public interface:
 All persistence goes through the Repository interface; no direct file I/O here.
 Status-change logic handles applied_at automatically to keep records consistent
 with ApplicationRecord schema constraints.
+Status transition policy is enforced by status_policy.py — update_status()
+rejects invalid transitions before any persistence.
 
 Dashboard metrics and export are NOT implemented here — that is Slice 9.
 """
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import logging
 
+from app.reporting.status_policy import explain_invalid_transition, is_valid_transition
 from app.schemas.application import ApplicationRecord, ApplicationStatus
 from app.storage.repository import Repository
 from app.utils.time import utc_now
@@ -92,6 +95,8 @@ class TrackerService:
         """
         Update the status of an existing application.
 
+        The transition is validated against the centralized status policy
+        (status_policy.py) before any state is mutated or persisted.
         Automatically sets applied_at when transitioning to a status that
         requires it, and clears it when returning to a pre-application status.
         The updated record is fully revalidated before saving.
@@ -105,10 +110,16 @@ class TrackerService:
 
         Raises:
             ValueError: if no application with the given ID is found.
+            ValueError: if the transition from the current status to new_status
+                        is not permitted by the status transition policy.
         """
         record = self.get_application(application_id)
         if record is None:
             raise ValueError(f"No application found with id '{application_id}'")
+
+        # Policy check — must happen before any mutation or persistence.
+        if not is_valid_transition(record.status, new_status):
+            raise ValueError(explain_invalid_transition(record.status, new_status))
 
         now = utc_now()
         merged = record.model_dump(mode="json")

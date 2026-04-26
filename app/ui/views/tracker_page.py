@@ -1,8 +1,9 @@
 """
-Application Tracker page — Slice 10 (updated from Slice 8).
+Application Tracker page — Slice 11 (updated from Slice 10).
 
-Displays all saved ApplicationRecords with search, filter, sort, and notes
-editing. Status updates and notes updates both persist through TrackerService.
+Displays all saved ApplicationRecords with search, filter, sort, status update,
+and notes editing. The status-update selectbox respects the centralized workflow
+policy — only valid target statuses for each record's current status are shown.
 
 Page structure:
   1. Load all application records via TrackerService.
@@ -27,12 +28,12 @@ Sort behavior:
   - Sort is applied after filter.
 
 Status update behavior:
-  - All 9 ApplicationStatus values are available as update targets.
-  - The selectbox always shows the record's true current status, regardless of
-    which status it holds. No fallback to a wrong default.
+  - The selectbox always shows the record's true current status first.
+  - Only valid target statuses from the centralized policy are offered.
+  - Terminal statuses (REJECTED, WITHDRAWN) show no further options.
   - applied_at is set/cleared automatically by TrackerService.
-  - Schema constraint failures (e.g. moving to APPROVED without a resume_id)
-    are caught and shown as user-visible errors rather than crashing.
+  - Policy violations are blocked at the service layer; the UI reflects the
+    policy so users rarely encounter service-layer rejections.
 
 Notes editing:
   - Text area pre-filled with current notes.
@@ -41,6 +42,7 @@ Notes editing:
 
 All persistence delegates to TrackerService.
 All filtering/sorting delegates to apply_tracker_view from tracker_query.
+Status transition options delegate to allowed_target_statuses from status_policy.
 This file is a thin UI shell only — no business logic lives here.
 """
 from __future__ import annotations
@@ -48,6 +50,7 @@ from __future__ import annotations
 from pydantic import ValidationError
 import streamlit as st
 
+from app.reporting.status_policy import allowed_target_statuses
 from app.reporting.tracker import TrackerService
 from app.reporting.tracker_query import (
     SORT_NEWEST,
@@ -60,21 +63,17 @@ from app.storage.file_store import FileStore
 from app.utils.time import format_date
 
 # Human-readable labels for ALL 9 ApplicationStatus values.
-# Used in both the status-update selectbox and the filter selectbox.
 _STATUS_LABEL: dict[ApplicationStatus, str] = {
-    ApplicationStatus.DISCOVERED:  "Discovered",
-    ApplicationStatus.SAVED:       "Saved",
-    ApplicationStatus.TAILORED:    "Tailored",
-    ApplicationStatus.APPROVED:    "Approved",
-    ApplicationStatus.APPLIED:     "Applied",
+    ApplicationStatus.DISCOVERED:   "Discovered",
+    ApplicationStatus.SAVED:        "Saved",
+    ApplicationStatus.TAILORED:     "Tailored",
+    ApplicationStatus.APPROVED:     "Approved",
+    ApplicationStatus.APPLIED:      "Applied",
     ApplicationStatus.INTERVIEWING: "Interviewing",
-    ApplicationStatus.OFFERED:     "Offer received",
-    ApplicationStatus.REJECTED:    "Rejected",
-    ApplicationStatus.WITHDRAWN:   "Withdrawn",
+    ApplicationStatus.OFFERED:      "Offer received",
+    ApplicationStatus.REJECTED:     "Rejected",
+    ApplicationStatus.WITHDRAWN:    "Withdrawn",
 }
-
-# All 9 statuses, in enum-definition order, for the status-update selectbox.
-_ALL_STATUS_OPTIONS: list[ApplicationStatus] = list(ApplicationStatus)
 
 # "All" sentinel value for the status filter selectbox.
 _ALL_STATUSES = "all"
@@ -210,19 +209,32 @@ def _render_record(record: ApplicationRecord, tracker: TrackerService) -> None:
 def _render_status_update(record: ApplicationRecord, tracker: TrackerService) -> None:
     """Render the status selectbox and Save button for one record.
 
-    Uses all 9 ApplicationStatus values so the selectbox always reflects the
-    record's true current status — no silent fallback to an incorrect default.
+    Options are built from the centralized policy:
+      - The current status is always the first option (truthful, stable).
+      - Only valid target statuses from allowed_target_statuses() follow.
+      - No invalid transitions are offered; no policy logic lives here.
+
+    If the current status is terminal (no allowed transitions), a message is
+    shown and no selectbox or Save button is rendered.
     """
     st.markdown("**Update status**")
 
-    # Since _ALL_STATUS_OPTIONS contains every ApplicationStatus value, this
-    # index() call will always succeed without a try/except fallback.
-    current_idx = _ALL_STATUS_OPTIONS.index(record.status)
+    current_label = _STATUS_LABEL.get(record.status, record.status.value)
+    st.caption(f"Current: **{current_label}**")
+
+    allowed = allowed_target_statuses(record.status)
+
+    if not allowed:
+        st.caption("Terminal status — no further transitions available.")
+        return
+
+    # Current status first so index 0 = no-op; then allowed targets in enum order.
+    options = [record.status] + [s for s in allowed if s != record.status]
 
     new_status = st.selectbox(
-        "Status",
-        options=_ALL_STATUS_OPTIONS,
-        index=current_idx,
+        "Move to",
+        options=options,
+        index=0,
         format_func=lambda s: _STATUS_LABEL.get(s, s.value),
         key=f"status_select_{record.application_id}",
         label_visibility="collapsed",
