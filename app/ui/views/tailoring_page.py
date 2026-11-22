@@ -510,9 +510,12 @@ def _render_approval_section() -> None:
             try:
                 cfg = get_config()
                 store = FileStore(cfg.data_dir)
-                tracker = TrackerService(store)
+                from app.reporting.history import HistoryService
+                history = HistoryService(store)
+                tracker = TrackerService(store, history=history)
                 record = approve_and_save(
-                    resume, cl, resume_report, cl_report, tracker, store
+                    resume, cl, resume_report, cl_report, tracker, store,
+                    history=history,
                 )
                 st.session_state.saved_application_record = record
                 st.session_state.approved_artifact_signature = current_sig

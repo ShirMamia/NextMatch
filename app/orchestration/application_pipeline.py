@@ -1,5 +1,5 @@
 """
-Application approval pipeline — Slice 8.
+Application approval pipeline — Slice 8 (extended in Slice 12).
 
 Entry point: approve_and_save(...)
 
@@ -12,13 +12,17 @@ Responsibilities:
   2. Rebuild the TailoredResume with approved=True / approved_at via model_validate.
   3. Persist the approved resume (and optional cover letter) through the Repository.
   4. Create and save an ApplicationRecord (status=TAILORED) via TrackerService.
-  5. Return the ApplicationRecord exactly as returned by TrackerService.save_application.
+  5. Emit an APPLICATION_CREATED event via HistoryService (best-effort, non-fatal).
+  6. Return the ApplicationRecord exactly as returned by TrackerService.save_application.
 
 Partial-persistence note: artifacts are saved to the repo before the tracker record
 is written. If tracker.save_application raises after artifact saves, the artifacts
 will be orphaned in the repo but no ApplicationRecord will exist. The Repository
 interface does not support rollback in V1; this is an acceptable risk for a single-user
 local store.
+
+History emission is best-effort: if append_event() raises after the record is saved,
+the error is logged and the ApplicationRecord is still returned to the caller.
 
 This module does not:
   - call the LLM
@@ -30,6 +34,7 @@ This module does not:
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from app.reporting.tracker import TrackerService
 from app.schemas.application import ApplicationRecord, ApplicationStatus
@@ -38,6 +43,9 @@ from app.schemas.validation import ValidationReport
 from app.storage.repository import Repository
 from app.utils.ids import generate_id
 from app.utils.time import utc_now
+
+if TYPE_CHECKING:
+    from app.reporting.history import HistoryService
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +64,7 @@ def approve_and_save(
     cl_report: ValidationReport | None,
     tracker: TrackerService,
     repo: Repository,
+    history: HistoryService | None = None,
 ) -> ApplicationRecord:
     """
     Enforce the approval gate, persist artifacts, and create an ApplicationRecord.
@@ -69,6 +78,9 @@ def approve_and_save(
                        not None; must match cl.draft_id and must have passed.
         tracker:       TrackerService used to save the ApplicationRecord.
         repo:          Repository used to persist approved artifacts.
+        history:       Optional HistoryService. If provided, an APPLICATION_CREATED
+                       event is emitted after the record is saved. Emission is
+                       best-effort — failures are logged and not re-raised.
 
     Returns:
         The ApplicationRecord exactly as returned by tracker.save_application().
@@ -155,4 +167,23 @@ def approve_and_save(
         record.application_id,
         record.job_id,
     )
+
+    # Best-effort history emission — must not fail the primary pipeline.
+    if history is not None:
+        try:
+            from app.reporting.history import make_application_created_event
+            event = make_application_created_event(
+                application_id=saved.application_id,
+                initial_status=saved.status,
+                job_id=saved.job_id,
+                candidate_id=saved.candidate_id,
+            )
+            history.append_event(event)
+        except Exception:
+            logger.exception(
+                "Failed to append APPLICATION_CREATED event for application '%s'; "
+                "record was saved successfully.",
+                saved.application_id,
+            )
+
     return saved

@@ -1,5 +1,5 @@
 """
-Focused tests for Slice 8 — Application Tracker and Approval Pipeline.
+Focused tests for Slices 8 and 12 — Application Tracker and Approval Pipeline.
 
 Covers:
   1.  approve_and_save blocked when resume is None
@@ -19,6 +19,11 @@ Covers:
   15. tracker.update_status sets applied_at for APPLIED
   16. tracker.update_status clears applied_at when reverting to TAILORED
   17. tracker.update_status raises ValueError for unknown application_id
+  18. approve_and_save emits exactly one APPLICATION_CREATED event on success (Slice 12)
+  19. emitted creation event has correct payload fields (Slice 12)
+  20. failed approval emits no event (Slice 12)
+  21. no duplicate creation event for one approval (Slice 12)
+  22. approve_and_save succeeds without history (Slice 12)
 """
 from __future__ import annotations
 
@@ -28,8 +33,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.orchestration.application_pipeline import ApprovalError, approve_and_save
+from app.reporting.history import HistoryService
 from app.reporting.tracker import TrackerService
 from app.schemas.application import ApplicationRecord, ApplicationStatus
+from app.schemas.application_event import ApplicationCreatedEvent
 from app.schemas.tailoring import CoverLetterDraft, EvidenceLink, GroundedText, TailoredBullet, TailoredResume
 from app.schemas.validation import FlagSeverity, FlagType, ValidationFlag, ValidationReport
 from app.storage.file_store import FileStore
@@ -284,6 +291,109 @@ class TestApproveAndSaveSuccess:
         tracker = _make_tracker(tmp_path)
         store = _make_store(tmp_path)
         record = approve_and_save(resume, cl, resume_report, cl_report, tracker, store)
+        assert record.status == ApplicationStatus.TAILORED
+
+
+# ---------------------------------------------------------------------------
+# Approval pipeline — history emission contract (Slice 12)
+# ---------------------------------------------------------------------------
+
+class TestApproveAndSaveHistory:
+    """
+    Verifies the audit trail contract for the approval write path.
+
+    Design:
+      - approve_and_save is the sole emitter of APPLICATION_CREATED events.
+      - TrackerService.save_application() does not emit any event.
+      - History is optional (history=None means no event is emitted).
+      - A successful approval emits exactly one APPLICATION_CREATED event.
+      - A failed approval (gate blocked) emits no event.
+    """
+
+    def _setup(self, tmp_path):
+        """Return (store, tracker, history) backed by the same tmp_path."""
+        store = FileStore(tmp_path)
+        history = HistoryService(store)
+        tracker = TrackerService(store, history=history)
+        return store, tracker, history
+
+    def test_successful_approval_emits_exactly_one_creation_event(self, tmp_path):
+        store, tracker, history = self._setup(tmp_path)
+        resume = _resume()
+        resume_report = _passing_report(resume.resume_id)
+        record = approve_and_save(resume, None, resume_report, None, tracker, store, history=history)
+        events = history.list_events_for_application(record.application_id)
+        assert len(events) == 1
+
+    def test_emitted_event_is_application_created_event(self, tmp_path):
+        store, tracker, history = self._setup(tmp_path)
+        resume = _resume()
+        resume_report = _passing_report(resume.resume_id)
+        record = approve_and_save(resume, None, resume_report, None, tracker, store, history=history)
+        events = history.list_events_for_application(record.application_id)
+        assert isinstance(events[0], ApplicationCreatedEvent)
+
+    def test_creation_event_payload_has_correct_application_id(self, tmp_path):
+        store, tracker, history = self._setup(tmp_path)
+        resume = _resume()
+        resume_report = _passing_report(resume.resume_id)
+        record = approve_and_save(resume, None, resume_report, None, tracker, store, history=history)
+        event = history.list_events_for_application(record.application_id)[0]
+        assert event.application_id == record.application_id
+
+    def test_creation_event_payload_has_correct_initial_status(self, tmp_path):
+        store, tracker, history = self._setup(tmp_path)
+        resume = _resume()
+        resume_report = _passing_report(resume.resume_id)
+        record = approve_and_save(resume, None, resume_report, None, tracker, store, history=history)
+        event = history.list_events_for_application(record.application_id)[0]
+        assert isinstance(event, ApplicationCreatedEvent)
+        assert event.payload.initial_status == ApplicationStatus.TAILORED
+
+    def test_creation_event_payload_has_correct_job_id(self, tmp_path):
+        store, tracker, history = self._setup(tmp_path)
+        resume = _resume()
+        resume_report = _passing_report(resume.resume_id)
+        record = approve_and_save(resume, None, resume_report, None, tracker, store, history=history)
+        event = history.list_events_for_application(record.application_id)[0]
+        assert isinstance(event, ApplicationCreatedEvent)
+        assert event.payload.job_id == resume.job_id
+
+    def test_creation_event_payload_has_correct_candidate_id(self, tmp_path):
+        store, tracker, history = self._setup(tmp_path)
+        resume = _resume()
+        resume_report = _passing_report(resume.resume_id)
+        record = approve_and_save(resume, None, resume_report, None, tracker, store, history=history)
+        event = history.list_events_for_application(record.application_id)[0]
+        assert isinstance(event, ApplicationCreatedEvent)
+        assert event.payload.candidate_id == resume.candidate_id
+
+    def test_failed_approval_emits_no_event(self, tmp_path):
+        """Gate failure happens before save; no event should be written."""
+        store, tracker, history = self._setup(tmp_path)
+        resume = _resume()
+        with pytest.raises(ApprovalError):
+            approve_and_save(resume, None, None, None, tracker, store, history=history)
+        # No application was created, so load_all should be empty.
+        assert store.load_all("application_events") == []
+
+    def test_no_duplicate_creation_event_for_one_approval(self, tmp_path):
+        """One successful approval → exactly one event, not two or more."""
+        store, tracker, history = self._setup(tmp_path)
+        resume = _resume()
+        resume_report = _passing_report(resume.resume_id)
+        record = approve_and_save(resume, None, resume_report, None, tracker, store, history=history)
+        events = history.list_events_for_application(record.application_id)
+        assert len(events) == 1
+
+    def test_approval_succeeds_without_history(self, tmp_path):
+        """history is optional — passing None must not affect the primary write path."""
+        store = _make_store(tmp_path)
+        tracker = TrackerService(store)  # no history
+        resume = _resume()
+        resume_report = _passing_report(resume.resume_id)
+        record = approve_and_save(resume, None, resume_report, None, tracker, store, history=None)
+        assert isinstance(record, ApplicationRecord)
         assert record.status == ApplicationStatus.TAILORED
 
 

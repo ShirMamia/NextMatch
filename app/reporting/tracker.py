@@ -1,5 +1,5 @@
 """
-Tracker service — Slice 8.
+Tracker service — Slice 8 (extended in Slices 11 and 12).
 
 Provides ApplicationRecord CRUD through the storage layer.
 
@@ -16,16 +16,26 @@ with ApplicationRecord schema constraints.
 Status transition policy is enforced by status_policy.py — update_status()
 rejects invalid transitions before any persistence.
 
+When a HistoryService is provided at construction time:
+  - update_status() emits a STATUS_UPDATED event after a successful save.
+  - update_notes() emits a NOTES_UPDATED event after a successful save (no-ops skipped).
+History emission is best-effort: if append_event() raises, the failure is logged
+but not re-raised. The primary record update is always the source-of-truth success.
+
 Dashboard metrics and export are NOT implemented here — that is Slice 9.
 """
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from app.reporting.status_policy import explain_invalid_transition, is_valid_transition
 from app.schemas.application import ApplicationRecord, ApplicationStatus
 from app.storage.repository import Repository
 from app.utils.time import utc_now
+
+if TYPE_CHECKING:
+    from app.reporting.history import HistoryService
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +62,9 @@ _NO_APPLIED_AT: frozenset[ApplicationStatus] = frozenset({
 class TrackerService:
     """Application record CRUD over the storage layer."""
 
-    def __init__(self, repo: Repository) -> None:
+    def __init__(self, repo: Repository, history: HistoryService | None = None) -> None:
         self._repo = repo
+        self._history = history
 
     def save_application(self, record: ApplicationRecord) -> ApplicationRecord:
         """Persist an ApplicationRecord, creating or overwriting by application_id.
@@ -101,6 +112,10 @@ class TrackerService:
         requires it, and clears it when returning to a pre-application status.
         The updated record is fully revalidated before saving.
 
+        History emission is best-effort: if HistoryService.append_event() raises
+        after the primary save succeeds, the error is logged and not re-raised.
+        The updated ApplicationRecord is still returned to the caller.
+
         Args:
             application_id: ID of the record to update.
             new_status:     The target ApplicationStatus.
@@ -121,6 +136,7 @@ class TrackerService:
         if not is_valid_transition(record.status, new_status):
             raise ValueError(explain_invalid_transition(record.status, new_status))
 
+        old_status = record.status
         now = utc_now()
         merged = record.model_dump(mode="json")
         merged["status"] = new_status.value
@@ -136,23 +152,52 @@ class TrackerService:
         logger.debug(
             "Updated application '%s': %s → %s",
             application_id,
-            record.status.value,
+            old_status.value,
             new_status.value,
         )
+
+        # Best-effort history emission — must not fail the primary update.
+        if self._history is not None:
+            try:
+                from app.reporting.history import make_status_updated_event
+                event = make_status_updated_event(
+                    application_id=application_id,
+                    old_status=old_status,
+                    new_status=new_status,
+                )
+                self._history.append_event(event)
+            except Exception:
+                logger.exception(
+                    "Failed to append STATUS_UPDATED event for application '%s' "
+                    "(%s → %s); primary update succeeded.",
+                    application_id,
+                    old_status.value,
+                    new_status.value,
+                )
+
         return updated
 
     def update_notes(self, application_id: str, notes: str) -> ApplicationRecord:
         """Update the free-text notes on an existing application.
 
+        If the incoming notes value is identical to the existing notes, this
+        method returns the current record unchanged without performing a save
+        or emitting a history event (no-op guard).
+
         Uses the same model_validate pattern as update_status to ensure
         full schema revalidation before persisting.
+
+        History emission is best-effort: if HistoryService.append_event() raises
+        after the primary save succeeds, the error is logged and not re-raised.
+        The updated ApplicationRecord is still returned to the caller.
 
         Args:
             application_id: ID of the record to update.
             notes:          New notes value. May be empty string.
 
         Returns:
-            The updated and revalidated ApplicationRecord.
+            The updated and revalidated ApplicationRecord (or the unchanged
+            record when the notes value did not change).
 
         Raises:
             ValueError: if no application with the given ID is found.
@@ -160,6 +205,11 @@ class TrackerService:
         record = self.get_application(application_id)
         if record is None:
             raise ValueError(f"Application '{application_id}' not found")
+
+        old_notes = record.notes or ""
+        # No-op guard: skip save and event when notes are unchanged.
+        if notes == old_notes:
+            return record
 
         now = utc_now()
         merged = record.model_dump(mode="json")
@@ -169,4 +219,22 @@ class TrackerService:
         updated = ApplicationRecord.model_validate(merged)
         self.save_application(updated)
         logger.debug("Updated notes for application '%s'", application_id)
+
+        # Best-effort history emission — must not fail the primary update.
+        if self._history is not None:
+            try:
+                from app.reporting.history import make_notes_updated_event
+                event = make_notes_updated_event(
+                    application_id=application_id,
+                    old_notes=old_notes,
+                    new_notes=notes,
+                )
+                self._history.append_event(event)
+            except Exception:
+                logger.exception(
+                    "Failed to append NOTES_UPDATED event for application '%s'; "
+                    "primary update succeeded.",
+                    application_id,
+                )
+
         return updated

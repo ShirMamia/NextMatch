@@ -1,9 +1,10 @@
 """
-Application Tracker page — Slice 11 (updated from Slice 10).
+Application Tracker page — Slice 12 (updated from Slice 11).
 
 Displays all saved ApplicationRecords with search, filter, sort, status update,
-and notes editing. The status-update selectbox respects the centralized workflow
-policy — only valid target statuses for each record's current status are shown.
+notes editing, and per-record audit history. The status-update selectbox respects
+the centralized workflow policy — only valid target statuses for each record's
+current status are shown.
 
 Page structure:
   1. Load all application records via TrackerService.
@@ -11,7 +12,8 @@ Page structure:
   3. Render search / filter / sort controls.
   4. Apply controls via apply_tracker_view() (pure helper, no UI logic).
   5. Show count of matching records.
-  6. For each visible record, render info, status update, and notes editing.
+  6. For each visible record, render info, status update, notes editing,
+     and an audit history section.
 
 Search behavior:
   - Case-insensitive substring match over application_id, job_id,
@@ -40,7 +42,12 @@ Notes editing:
   - "Save notes" persists through TrackerService.update_notes().
   - Notes save does not rerun the page; success is shown inline.
 
-All persistence delegates to TrackerService.
+Audit history:
+  - Each record expander shows its full event history (oldest first).
+  - Events are loaded from HistoryService.list_events_for_application().
+  - Displayed inline as a simple table of timestamp, event type, and summary.
+
+All persistence delegates to TrackerService (wired with HistoryService).
 All filtering/sorting delegates to apply_tracker_view from tracker_query.
 Status transition options delegate to allowed_target_statuses from status_policy.
 This file is a thin UI shell only — no business logic lives here.
@@ -50,6 +57,7 @@ from __future__ import annotations
 from pydantic import ValidationError
 import streamlit as st
 
+from app.reporting.history import HistoryService
 from app.reporting.status_policy import allowed_target_statuses
 from app.reporting.tracker import TrackerService
 from app.reporting.tracker_query import (
@@ -58,6 +66,12 @@ from app.reporting.tracker_query import (
     apply_tracker_view,
 )
 from app.schemas.application import ApplicationRecord, ApplicationStatus
+from app.schemas.application_event import (
+    ApplicationCreatedEvent,
+    ApplicationEventType,
+    NotesUpdatedEvent,
+    StatusUpdatedEvent,
+)
 from app.services.config import get_config
 from app.storage.file_store import FileStore
 from app.utils.time import format_date
@@ -75,6 +89,13 @@ _STATUS_LABEL: dict[ApplicationStatus, str] = {
     ApplicationStatus.WITHDRAWN:    "Withdrawn",
 }
 
+# Human-readable labels for event types.
+_EVENT_TYPE_LABEL: dict[ApplicationEventType, str] = {
+    ApplicationEventType.APPLICATION_CREATED: "Application created",
+    ApplicationEventType.STATUS_UPDATED:      "Status updated",
+    ApplicationEventType.NOTES_UPDATED:       "Notes updated",
+}
+
 # "All" sentinel value for the status filter selectbox.
 _ALL_STATUSES = "all"
 
@@ -89,7 +110,8 @@ def render() -> None:
 
     cfg = get_config()
     store = FileStore(cfg.data_dir)
-    tracker = TrackerService(store)
+    history = HistoryService(store)
+    tracker = TrackerService(store, history=history)
 
     records = tracker.list_applications()
 
@@ -126,7 +148,7 @@ def render() -> None:
         return
 
     for record in visible:
-        _render_record(record, tracker)
+        _render_record(record, tracker, history)
 
 
 def _render_controls() -> tuple[str, ApplicationStatus | None, str]:
@@ -181,8 +203,12 @@ def _render_controls() -> tuple[str, ApplicationStatus | None, str]:
     return query, status_filter, sort_key
 
 
-def _render_record(record: ApplicationRecord, tracker: TrackerService) -> None:
-    """Render a single ApplicationRecord with status update and notes editing."""
+def _render_record(
+    record: ApplicationRecord,
+    tracker: TrackerService,
+    history: HistoryService,
+) -> None:
+    """Render a single ApplicationRecord with status update, notes, and history."""
     job_label = _resolve_job_label(record.job_id)
     current_label = _STATUS_LABEL.get(record.status, record.status.value)
     expander_title = f"{job_label} — {current_label}"
@@ -204,6 +230,9 @@ def _render_record(record: ApplicationRecord, tracker: TrackerService) -> None:
 
         st.divider()
         _render_notes_editor(record, tracker)
+
+        st.divider()
+        _render_history(record.application_id, history)
 
 
 def _render_status_update(record: ApplicationRecord, tracker: TrackerService) -> None:
@@ -279,6 +308,41 @@ def _render_notes_editor(record: ApplicationRecord, tracker: TrackerService) -> 
             st.error(f"Notes update failed: {exc}")
         except Exception as exc:
             st.error(f"Unexpected error: {exc}")
+
+
+def _render_history(application_id: str, history: HistoryService) -> None:
+    """Render the audit event history for one application, oldest first.
+
+    Shows event type, timestamp, and a one-line summary of each event payload.
+    Displays a caption if no events are recorded yet.
+    """
+    st.markdown("**History**")
+
+    events = history.list_events_for_application(application_id)
+
+    if not events:
+        st.caption("No history recorded yet.")
+        return
+
+    for event in events:
+        ts = format_date(event.created_at)
+        label = _EVENT_TYPE_LABEL.get(event.event_type, event.event_type.value)
+
+        if isinstance(event, ApplicationCreatedEvent):
+            summary = (
+                f"Created with status **{event.payload.initial_status.value}**"
+            )
+        elif isinstance(event, StatusUpdatedEvent):
+            old = _STATUS_LABEL.get(event.payload.old_status, event.payload.old_status.value)
+            new = _STATUS_LABEL.get(event.payload.new_status, event.payload.new_status.value)
+            summary = f"{old} → {new}"
+        elif isinstance(event, NotesUpdatedEvent):
+            new_len = len(event.payload.new_notes)
+            summary = f"Notes updated ({new_len} chars)"
+        else:
+            summary = ""
+
+        st.caption(f"{ts} — **{label}** — {summary}")
 
 
 def _resolve_job_label(job_id: str) -> str:

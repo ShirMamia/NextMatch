@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import streamlit as st
 
+from app.ui.demo import sample_inputs
 from app.ui.views import (
     dashboard_page,
     discovery_page,
@@ -83,6 +84,15 @@ with st.sidebar:
     st.title("NextMatch")
     st.caption("Evidence-grounded career copilot")
     st.divider()
+    if st.session_state.candidate_profile is None and not st.session_state.job_postings:
+        if st.button("Load sample profile and jobs", key="load_sample_data"):
+            profile, jobs = sample_inputs()
+            st.session_state.candidate_profile = profile
+            st.session_state.job_postings = jobs
+            st.session_state.selected_job = jobs[0]
+    loaded_profile = st.session_state.candidate_profile
+    if loaded_profile is not None and loaded_profile.candidate_id == "sample-candidate":
+        st.caption("Sample profile and jobs are fictional.")
     selected = st.radio("Navigate", list(PAGES.keys()), label_visibility="collapsed")
     st.divider()
     profile_ok = st.session_state.get("candidate_profile") is not None
